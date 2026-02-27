@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AFO County PM Map (Hover + Click Popups)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css" />
+  <script src="https://js.arcgis.com/4.29/"></script>
+
+  <style>
+    html, body, #viewDiv { height: 100%; width: 100%; margin: 0; padding: 0; }
+
+    /* Hover card */
+    #hoverCard{
+      position:absolute; background:#fff; padding:10px 12px; border-radius:8px;
+      box-shadow:0 2px 10px rgba(0,0,0,0.25);
+      display:none; pointer-events:none;
+      font-family:Arial, sans-serif; font-size:13px; line-height:1.35;
+      max-width:360px; z-index:10;
+    }
+    #hoverCard .pmName{ font-weight:700; font-size:14px; margin-bottom:2px; }
+    #hoverCard .pmLine{ margin:1px 0; }
+
+    .popup-email a{ text-decoration:underline; }
+
+    /* Control panel */
+    #controls{
+      background:rgba(255,255,255,0.92); padding:10px; border-radius:10px;
+      box-shadow:0 2px 10px rgba(0,0,0,0.20);
+      font-family:Arial, sans-serif; width:230px;
+    }
+    #controls .title{ font-weight:700; margin-bottom:8px; font-size:13px; }
+    #controls .row{ display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+    #controls button{
+      border:1px solid #cfcfcf; background:#fff; border-radius:8px;
+      padding:7px 10px; cursor:pointer; font-size:12px; width:100%;
+    }
+    #controls button:hover{ background:#f3f3f3; }
+    #controls .small{ font-size:11px; opacity:0.8; margin-top:2px; line-height:1.25; }
+  </style>
+</head>
+
+<body>
+  <div id="viewDiv"></div>
+  <div id="hoverCard"></div>
+
+<script>
+require([
+  "esri/Map",
+  "esri/views/MapView",
+  "esri/layers/FeatureLayer",
+  "esri/layers/GraphicsLayer",
+  "esri/layers/MapImageLayer",
+  "esri/Graphic",
+  "esri/geometry/Point",
+  "esri/geometry/Extent",
+  "esri/symbols/PictureMarkerSymbol",
+  "esri/symbols/SimpleFillSymbol",
+  "esri/renderers/SimpleRenderer",
+  "esri/widgets/Search",
+  "esri/rest/locator",
+  "esri/core/reactiveUtils",
+  "esri/core/Collection"
+], function(
+  Map, MapView, FeatureLayer, GraphicsLayer, MapImageLayer,
+  Graphic, Point, Extent,
+  PictureMarkerSymbol, SimpleFillSymbol,
+  SimpleRenderer,
+  Search, locator, reactiveUtils, Collection
+) {
+
+  // ---------------------------------------------------------------------------
+  // SERVICES / ASSETS
+  // ---------------------------------------------------------------------------
+  const COUNTY_POLY_LAYER_URL =
+    "https://gis11.services.ncdot.gov/arcgis/rest/services/NCDOT_CountyBdy_Poly/MapServer/0";
+
+  const NC_STATE_POLY_LAYER_URL =
+    "https://gis11.services.ncdot.gov/arcgis/rest/services/NCDOT_StateBdy_poly/MapServer/0";
+
+  const ROADS_MAPSERVER_URL =
+    "https://gis11.services.ncdot.gov/arcgis/rest/services/NCDOT_RoadNC/RoadNC_CenterlinesColor/MapServer";
+
+  // ✅ New public logo URL (replaces the previous Corps logo)
+  const USACE_LOGO_URL =
+    "https://burgosgroup.com/wp-content/uploads/2016/12/usace-logo.png";
+
+  const AFO_LOGO_SIZE_PX = 32;
+
+  // Office address (geocode for exact placement)
+  const AFO_ADDRESS = "151 Patton Avenue, Asheville, NC 28801";
+  const GEOCODER_URL = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer";
+  const AFO_FALLBACK_POINT = new Point({ longitude: -82.5540, latitude: 35.5929 });
+
+  // ---------------------------------------------------------------------------
+  // PM ASSIGNMENTS
+  // ---------------------------------------------------------------------------
+  const PM = {
+    BROOKE: { name: "Brooke Davis", phone: "(828) 271-7980 ext 4232", email: "Brooke.A.Davis@usace.army.mil" },
+    JOEY:   { name: "Joey Winston",  phone: "(828) 271-7980 ext 4233", email: "Joseph.B.Winston@usace.army.mil" },
+    JOSH:   { name: "Josh Garner",   phone: "(828) 271-7980 ext 4231", email: "Joshua.G.Garner@usace.army.mil" }
+  };
+
+  const brookeCounties = new Set(["Cherokee","Graham","Swain","Clay","Henderson","Madison","Yancey","Watauga","Ashe","Alleghany"]);
+  const joeyCounties   = new Set(["Haywood","Jackson","Transylvania","McDowell","Polk","Burke","Caldwell","Surry","Yadkin"]);
+  const joshCounties   = new Set(["Macon","Buncombe","Rutherford","Mitchell","Avery","Wilkes"]);
+
+  // Hover colors: Red = Joey, Green = Brooke, Blue = Josh
+  const HOVER_COLORS = {
+    [PM.JOEY.name]:   [255,   0,   0, 0.25],
+    [PM.BROOKE.name]: [  0, 255,   0, 0.25],
+    [PM.JOSH.name]:   [  0,   0, 255, 0.25]
+  };
+
+  // Subset counties
+  const subsetCounties = [
+    "Cherokee","Graham","Swain","Clay","Henderson","Madison","Yancey","Avery","Watauga","Ashe","Alleghany",
+    "Haywood","Jackson","Transylvania","McDowell","Polk","Burke","Caldwell","Surry","Yadkin",
+    "Macon","Buncombe","Rutherford","Mitchell","Wilkes"
+  ];
+
+  function sqlStringList(values) {
+    return values.map(v => "'" + String(v).replace(/'/g, "''") + "'").join(",");
+  }
+  function normalizeCountyName(name) { return (name || "").trim(); }
+
+  function assignPM(countyName) {
+    if (!countyName) return null;
+    const cn = countyName === "Surrey" ? "Surry" : countyName;
+    if (brookeCounties.has(cn)) return PM.BROOKE;
+    if (joeyCounties.has(cn))   return PM.JOEY;
+    if (joshCounties.has(cn))   return PM.JOSH;
+    return null;
+  }
+
+  // Popup content for county clicks (same data as hover, with mailto)
+  function buildCountyContactHTML(countyName) {
+    const pm = assignPM(countyName);
+    if (!pm) {
+      return `
+        <div class="popup-email" style="line-height:1.4;">
+          <div style="font-weight:700; font-size:14px;">PM assignment not found</div>
+          <div style="margin-top:6px;"><strong>County:</strong> ${countyName || "County"}</div>
+        </div>
+      `;
+    }
+    return `
+      <div class="popup-email" style="line-height:1.4;">
+        <div style="font-weight:700; font-size:14px;">${pm.name}</div>
+        <div style="margin-top:2px;">${pm.phone}</div>
+        <div style="margin-top:2px;"><a href="mailto:${pm.email}">${pm.email}</a></div>
+        <div style="margin-top:8px;"><strong>County:</strong> ${countyName}</div>
+      </div>
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
+  // LAYERS
+  // ---------------------------------------------------------------------------
+
+  // NC State outline (white)
+  const ncStateLayer = new FeatureLayer({ url: NC_STATE_POLY_LAYER_URL, outFields: ["*"] });
+  ncStateLayer.renderer = new SimpleRenderer({
+    symbol: new SimpleFillSymbol({
+      style: "solid",
+      color: [255,255,255,0.00],
+      outline: { color: [255,255,255,0.95], width: 2.2 }
+    })
+  });
+
+  // Roads
+  const roadsLayer = new MapImageLayer({
+    url: ROADS_MAPSERVER_URL,
+    opacity: 0.85,
+    sublayers: [
+      { id: 0, visible: true },
+      { id: 1, visible: true },
+      { id: 2, visible: false },
+      { id: 3, visible: false },
+      { id: 4, visible: false }
+    ]
+  });
+
+  // Counties (white outline)
+  const countiesLayer = new FeatureLayer({
+    url: COUNTY_POLY_LAYER_URL,
+    outFields: ["*"],
+    definitionExpression: `UPPER(NAME) IN (${sqlStringList(subsetCounties.map(c => c.toUpperCase()))})`,
+    popupEnabled: false
+  });
+  countiesLayer.renderer = new SimpleRenderer({
+    symbol: new SimpleFillSymbol({
+      style: "solid",
+      color: [255,255,255,0.03],
+      outline: { color: [255,255,255,0.90], width: 1.5 }
+    })
+  });
+
+  // Hover & selection overlays
+  const hoverGraphics = new GraphicsLayer({ title: "Hover Overlay" });
+  const selectGraphics = new GraphicsLayer({ title: "Selection Overlay" });
+
+  // ---------------------------------------------------------------------------
+  // OFFICE MARKER AS ITS OWN FEATURELAYER (CLICKABLE FEATURE + POPUP)
+  // ---------------------------------------------------------------------------
+  const officePopupHTML = `
+    <div style="line-height:1.4;" class="popup-email">
+      <div><strong>U.S. Army Corps of Engineers</strong></div>
+      <div><strong>Wilmington District</strong></div>
+      <div><strong>Asheville Regulatory Field Office</strong></div>
+      <div>151 Patton Avenue</div>
+      <div>Room #208</div>
+      <div>Asheville, NC 28801</div>
+
+      <hr style="margin:10px 0;">
+
+      <div><strong><u>Staff Directory</u></strong></div>
+
+      <div style="margin-top:8px;">
+        <strong>Mickey Sugg, Chief</strong><br>
+        <a href="mailto:Mickey.T.Sugg@usace.army.mil">Mickey.T.Sugg@usace.army.mil</a><br>
+        (828) 271-7980 ext 4222
+      </div>
+
+      <hr style="margin:8px 0;">
+
+      <div>
+        <strong>Brooke Davis, Regulatory Specialist</strong><br>
+        <a href="mailto:Brooke.A.Davis@usace.army.mil">Brooke.A.Davis@usace.army.mil</a><br>
+        (828) 271-7980 ext 4232
+      </div>
+
+      <hr style="margin:8px 0;">
+
+      <div>
+        <strong>Joey Winston, Regulatory Specialist</strong><br>
+        <a href="mailto:Joseph.B.Winston@usace.army.mil">Joseph.B.Winston@usace.army.mil</a><br>
+        (828) 271-7980 ext 4233
+      </div>
+
+      <hr style="margin:8px 0;">
+
+      <div>
+        <strong>Myles Lance, Regulatory Specialist</strong><br>
+        <a href="mailto:Christien.M.Lance@usace.army.mil">Christien.M.Lance@usace.army.mil</a><br>
+        (828) 271-7980 ext 4221
+      </div>
+
+      <hr style="margin:8px 0;">
+
+      <div>
+        <strong>Josh Garner, Regulatory Specialist</strong><br>
+        <a href="mailto:Joshua.G.Garner@usace.army.mil">Joshua.G.Garner@usace.army.mil</a><br>
+        (828) 271-7980 ext 4231
+      </div>
+    </div>
+  `;
+
+  const officeGraphic = new Graphic({
+    geometry: AFO_FALLBACK_POINT,
+    attributes: { ObjectID: 1, name: "Asheville Regulatory Field Office" }
+  });
+
+  const officeLayer = new FeatureLayer({
+    title: "USACE Asheville Regulatory Field Office",
+    source: new Collection([officeGraphic]),
+    objectIdField: "ObjectID",
+    fields: [
+      { name: "ObjectID", type: "oid" },
+      { name: "name", type: "string" }
+    ],
+    geometryType: "point",
+    spatialReference: { wkid: 4326 },
+    popupEnabled: true,
+    popupTemplate: {
+      title: "{name}",
+      content: officePopupHTML
+    },
+    renderer: new SimpleRenderer({
+      symbol: new PictureMarkerSymbol({
+        url: USACE_LOGO_URL,
+        width: `${AFO_LOGO_SIZE_PX}px`,
+        height: `${AFO_LOGO_SIZE_PX}px`
+      })
+    })
+  });
+
+  // ---------------------------------------------------------------------------
+  // MAP + VIEW
+  // ---------------------------------------------------------------------------
+  const map = new Map({
+    basemap: "hybrid",
+    layers: [
+      ncStateLayer,
+      roadsLayer,
+      countiesLayer,
+      hoverGraphics,
+      selectGraphics,
+      officeLayer // top
+    ]
+  });
+
+  const view = new MapView({
+    container: "viewDiv",
+    map,
+    center: [-82.55, 35.60],
+    zoom: 8
+  });
+
+  view.ui.add(new Search({ view, includeDefaultSources: true }), "top-right");
+
+  // ---------------------------------------------------------------------------
+  // Default opening extent + Last-view persistence
+  // ---------------------------------------------------------------------------
+  const STORAGE_KEY = "afo_map_last_extent_v1";
+  let defaultExtent = null;
+
+  function extentToJSON(ext) {
+    return {
+      xmin: ext.xmin, ymin: ext.ymin, xmax: ext.xmax, ymax: ext.ymax,
+      spatialReference: ext.spatialReference ? ext.spatialReference.toJSON() : { wkid: 3857 }
+    };
+  }
+  function jsonToExtent(obj) {
+    try {
+      if (!obj) return null;
+      return new Extent({
+        xmin: obj.xmin, ymin: obj.ymin, xmax: obj.xmax, ymax: obj.ymax,
+        spatialReference: obj.spatialReference || { wkid: 3857 }
+      });
+    } catch (_) { return null; }
+  }
+  function saveLastExtent() {
+    if (!view.extent) return;
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(extentToJSON(view.extent))); } catch (_) {}
+  }
+  function loadLastExtent() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      return jsonToExtent(JSON.parse(raw));
+    } catch (_) { return null; }
+  }
+  async function goDefaultView() {
+    if (defaultExtent) await view.goTo(defaultExtent);
+  }
+
+  countiesLayer.when(async () => {
+    const last = loadLastExtent();
+    const result = await countiesLayer.queryExtent();
+    if (result && result.extent) defaultExtent = result.extent.expand(1.02);
+    if (last) await view.goTo(last);
+    else await goDefaultView();
+  });
+
+  reactiveUtils.when(() => view.stationary === true, () => saveLastExtent());
+
+  // Reset control
+  const controls = document.createElement("div");
+  controls.id = "controls";
+  controls.className = "esri-widget";
+  controls.innerHTML = `
+    <div class="title">View Controls</div>
+    <div class="row">
+      <button id="btnReset" title="Clear saved position and return to the default opening view">
+        Reset to Default View
+      </button>
+    </div>
+    <div class="small">Your last map position is saved automatically.</div>
+  `;
+  view.ui.add(controls, "top-left");
+  controls.querySelector("#btnReset").addEventListener("click", async () => {
+    try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+    await goDefaultView();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Geocode office and update the office feature geometry (keeps it truly clickable)
+  // ---------------------------------------------------------------------------
+  view.when(() => {
+    locator.addressToLocations(GEOCODER_URL, {
+      address: { SingleLine: AFO_ADDRESS },
+      maxLocations: 1,
+      outFields: ["*"]
+    }).then((candidates) => {
+      const loc = candidates && candidates[0] && candidates[0].location;
+      if (!loc) return;
+
+      officeGraphic.geometry = loc;
+      officeLayer.applyEdits({ updateFeatures: [officeGraphic] }).catch(() => {});
+    }).catch(() => {});
+  });
+
+  // ---------------------------------------------------------------------------
+  // Hover + Click behavior
+  // ---------------------------------------------------------------------------
+  const hoverCard = document.getElementById("hoverCard");
+
+  function setHoverOverlay(geometry, pmName) {
+    hoverGraphics.removeAll();
+    const rgba = HOVER_COLORS[pmName] || [255,255,0,0.20];
+    hoverGraphics.add(new Graphic({
+      geometry,
+      symbol: new SimpleFillSymbol({
+        style: "solid",
+        color: rgba,
+        outline: { color: [255,255,255,0.85], width: 1.5 }
+      })
+    }));
+  }
+
+  function setSelectionOverlay(geometry) {
+    selectGraphics.removeAll();
+    selectGraphics.add(new Graphic({
+      geometry,
+      symbol: new SimpleFillSymbol({
+        style: "solid",
+        color: [0,0,0,0.00],
+        outline: { color: [255,255,255,1.0], width: 3.0 }
+      })
+    }));
+  }
+
+  function clearSelection() {
+    selectGraphics.removeAll();
+  }
+
+  // Hover only counties
+  view.on("pointer-leave", () => {
+    hoverCard.style.display = "none";
+    hoverGraphics.removeAll();
+  });
+
+  view.on("pointer-move", (event) => {
+    view.hitTest(event, { include: [countiesLayer] }).then((response) => {
+      const hit = response.results && response.results[0];
+      if (!hit || !hit.graphic) {
+        hoverCard.style.display = "none";
+        hoverGraphics.removeAll();
+        return;
+      }
+
+      const g = hit.graphic;
+      const countyName = normalizeCountyName(g.attributes.NAME);
+      const pm = assignPM(countyName);
+
+      setHoverOverlay(g.geometry, pm ? pm.name : "");
+
+      hoverCard.style.display = "block";
+      hoverCard.style.left = (event.x + 14) + "px";
+      hoverCard.style.top  = (event.y + 14) + "px";
+
+      if (!pm) {
+        hoverCard.innerHTML = `
+          <div class="pmName">${countyName || "County"}</div>
+          <div class="pmLine">PM assignment not found in the current roster.</div>
+        `;
+        return;
+      }
+
+      hoverCard.innerHTML = `
+        <div class="pmName">${pm.name}</div>
+        <div class="pmLine">${pm.phone}</div>
+        <div class="pmLine">${pm.email}</div>
+        <div class="pmLine" style="margin-top:6px;"><strong>County:</strong> ${countyName}</div>
+      `;
+    });
+  });
+
+  // Click: office OR county (both have popups that stay open for mailto clicks)
+  view.on("click", (event) => {
+    view.hitTest(event, { include: [officeLayer, countiesLayer] }).then((response) => {
+      const results = response.results || [];
+
+      // Office marker click
+      const officeHit = results.find(r => r.graphic && r.graphic.layer === officeLayer);
+      if (officeHit) {
+        view.popup.open({
+          features: [officeHit.graphic],
+          location: officeHit.graphic.geometry
+        });
+        return;
+      }
+
+      // County click
+      const countyHit = results.find(r => r.graphic && r.graphic.layer === countiesLayer);
+      if (countyHit) {
+        const g = countyHit.graphic;
+        const countyName = normalizeCountyName(g.attributes.NAME);
+
+        setSelectionOverlay(g.geometry);
+
+        view.popup.open({
+          title: countyName ? `${countyName} County` : "County",
+          content: buildCountyContactHTML(countyName || "County"),
+          location: event.mapPoint
+        });
+        return;
+      }
+
+      // Empty click clears selection and closes popup
+      clearSelection();
+      view.popup.close();
+    });
+  });
+
+});
+</script>
+</body>
+</html>
